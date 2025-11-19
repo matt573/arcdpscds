@@ -91,7 +91,8 @@ app.post('/update', (req, res) => {
     prof,
     pluginVer,
     subgroup,
-    groupOrder
+    groupOrder,
+    account
   } = req.body || {};
 
   if (!clientId || !Array.isArray(entries)) {
@@ -106,6 +107,7 @@ app.post('/update', (req, res) => {
     prof: Number.isInteger(prof) ? prof : 0,
     pluginVer: typeof pluginVer === 'string' ? pluginVer : null,
     subgroup: Number.isInteger(subgroup) ? subgroup : 0,
+    account: typeof account === 'string' ? account : null, // NEW
     entries: entries.map(e => ({
       label: String(e.label || ''),
       ready: !!e.ready,
@@ -137,6 +139,7 @@ app.get('/aggregate', (req, res) => {
       prof: v.prof || 0,
       pluginVer: v.pluginVer || null,
       subgroup: v.subgroup || 0,
+      account: v.account || null,  // NEW
       entries: v.entries || []
     });
   }
