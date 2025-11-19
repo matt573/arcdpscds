@@ -983,7 +983,7 @@ app.get('/', (req, res) => {
         </h1>
 
         <p class="hero-subtitle">
-          Monitor who is connected to your Guild&nbsp;Wars&nbsp;2 cooldown relay in real time. Clean overview, low overhead, automatic updates.
+          
         </p>
 
         <div class="hero-actions">
@@ -991,10 +991,7 @@ app.get('/', (req, res) => {
             <span class="btn-icon">⬇</span>
             <span>Download <strong>arcdps_cooldowns.dll</strong></span>
           </a>
-          <button class="btn btn-ghost" id="scrollToTable">
-            <span class="btn-icon">👁</span>
-            View active clients
-          </button>
+        
         </div>
 
         <p class="hero-note">
@@ -1003,10 +1000,7 @@ app.get('/', (req, res) => {
         </p>
 
         <div class="hero-meta">
-          <div class="hero-meta-pill">
-            <span>🕒</span>
-            <span id="lastUpdatedText">Page rendered at ${escHtml(serverTime)} (server time)</span>
-          </div>
+          
           <div class="hero-meta-pill">
             <span>🔄</span>
             Uses the relay to sync squad cooldowns across clients.
