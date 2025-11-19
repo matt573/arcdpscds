@@ -1,7 +1,8 @@
 {
-  "latest": "0.92",
+  "latest": "0.93",
   "download": "https://github.com/matt573/arcdpscds/raw/refs/heads/main/arcdps_cooldowns_bags.dll",
   "changelog": "Fix squad identity; better relay handling"
 
 }
+
 
