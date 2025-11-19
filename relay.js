@@ -165,6 +165,7 @@ app.get('/download/arcdps_cooldowns.dll', (req, res) => {
 
 // simple HTML status page with plugin version + subgroup + download link
 // simple HTML status page with plugin version + subgroup + download link
+// simple HTML status page with plugin version + subgroup + download link
 app.get('/', (req, res) => {
   prune();
 
@@ -257,7 +258,7 @@ app.get('/', (req, res) => {
       .replace(/'/g, '&#39;');
   }
 
-  res.type('html').send(`<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -1075,8 +1076,8 @@ app.get('/', (req, res) => {
               <select id="relaySelect">
                 <option value="all">All relays</option>
                 ${data.map((r, idx) => {
-                  const label = r.room || \`Relay \${idx + 1}\`;
-                  return \`<option value="\${idx}">\${escHtml(label)}</option>\`;
+                  const label = r.room || `Relay ${idx + 1}`;
+                  return '<option value="' + idx + '">' + escHtml(label) + '</option>';
                 }).join('')}
               </select>
             </div>
@@ -1085,7 +1086,7 @@ app.get('/', (req, res) => {
 
         <div id="relayList" class="relay-list">
           ${data.map((r, idx) => {
-            const roomLabel = r.room || \`Relay \${idx + 1}\`;
+            const roomLabel = r.room || `Relay ${idx + 1}`;
             const peers = r.peers || [];
             const statusClass =
               r.relayStatus === 'Live'
@@ -1105,43 +1106,43 @@ app.get('/', (req, res) => {
                 peerStatusClass = 'status-pill-stale';
               }
 
-              return \`
+              return `
                 <tr>
-                  <td data-label="#">\${i + 1}</td>
-                  <td data-label="ClientId">\${escHtml(p.clientId)}</td>
-                  <td data-label="Name">\${escHtml(p.name)}</td>
-                  <td data-label="Prof">\${escHtml(p.prof)}</td>
-                  <td data-label="Subgroup">\${escHtml(p.subgroup || '')}</td>
-                  <td data-label="PluginVer">\${escHtml(p.pluginVer || '')}</td>
-                  <td data-label="Entries">\${escHtml(p.entriesCount)}</td>
-                  <td data-label="Last seen (ms)">\${escHtml(p.lastSeenMsAgo)}</td>
+                  <td data-label="#">${i + 1}</td>
+                  <td data-label="ClientId">${escHtml(p.clientId)}</td>
+                  <td data-label="Name">${escHtml(p.name)}</td>
+                  <td data-label="Prof">${escHtml(p.prof)}</td>
+                  <td data-label="Subgroup">${escHtml(p.subgroup || '')}</td>
+                  <td data-label="PluginVer">${escHtml(p.pluginVer || '')}</td>
+                  <td data-label="Entries">${escHtml(p.entriesCount)}</td>
+                  <td data-label="Last seen (ms)">${escHtml(p.lastSeenMsAgo)}</td>
                   <td data-label="Status" class="status-cell">
-                    <span class="status-pill \${peerStatusClass}">
+                    <span class="status-pill ${peerStatusClass}">
                       <span class="status-pill-dot"></span>
-                      <span>\${peerStatusLabel}</span>
+                      <span>${peerStatusLabel}</span>
                     </span>
                   </td>
                 </tr>
-              \`;
+              `;
             }).join('');
 
-            return \`
-              <article class="relay-card" data-room-index="\${idx}">
+            return `
+              <article class="relay-card" data-room-index="${idx}">
                 <div class="relay-card-header">
                   <div style="display:flex;align-items:center;gap:6px;">
-                    <div class="relay-name">\${escHtml(roomLabel)}</div>
-                    <span class="relay-tag">#\${idx + 1}</span>
+                    <div class="relay-name">${escHtml(roomLabel)}</div>
+                    <span class="relay-tag">#${idx + 1}</span>
                   </div>
                   <div style="display:flex;align-items:center;gap:8px;">
-                    <div class="relay-count">\${peers.length} client\${peers.length === 1 ? '' : 's'}</div>
-                    <span class="status-chip \${statusClass}">
+                    <div class="relay-count">${peers.length} client${peers.length === 1 ? '' : 's'}</div>
+                    <span class="status-chip ${statusClass}">
                       <span class="status-chip-dot"></span>
-                      <span>\${escHtml(r.relayStatus)}</span>
+                      <span>${escHtml(r.relayStatus)}</span>
                     </span>
                   </div>
                 </div>
-                \${peers.length
-                  ? \`
+                ${peers.length
+                  ? `
                     <div class="relay-table-wrapper">
                       <table class="relay-table">
                         <thead>
@@ -1158,15 +1159,15 @@ app.get('/', (req, res) => {
                           </tr>
                         </thead>
                         <tbody>
-                          \${rows}
+                          ${rows}
                         </tbody>
                       </table>
                     </div>
-                  \`
-                  : \`<p class="relay-empty">No clients connected to this relay.</p>\`
+                  `
+                  : `<p class="relay-empty">No clients connected to this relay.</p>`
                 }
               </article>
-            \`;
+            `;
           }).join('')}
         </div>
 
@@ -1253,8 +1254,11 @@ app.get('/', (req, res) => {
     })();
   </script>
 </body>
-</html>`);
+</html>`;
+
+  res.type('html').send(html);
 });
+
 
 
 const PORT = process.env.PORT || 3456;
