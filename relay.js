@@ -1171,14 +1171,7 @@ app.get('/', (req, res) => {
       </div>
     </main>
 
-    <footer class="footer">
-      <div>
-        Relay Status 🟩 · lightweight GW2 cooldown relay monitor.
-      </div>
-      <div>
-        Data reflects clients seen in the last 15 seconds.
-      </div>
-    </footer>
+   
   </div>
 
   <script>
