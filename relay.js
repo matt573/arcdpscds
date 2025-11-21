@@ -140,7 +140,8 @@ app.get('/aggregate', (req, res) => {
       pluginVer: v.pluginVer || null,
       subgroup: v.subgroup || 0,
       account: v.account || null,  // NEW
-      entries: v.entries || []
+      entries: v.entries || [],
+      elite: v.elite || 0
     });
   }
 
