@@ -315,9 +315,8 @@ app.get('/', (req, res) => {
       pointer-events: none;
       z-index: -1;
     }
-a:active {
-  color: white; /* Or any other color you desire */
-}
+a:link, a:visited, a:hover, a:active 
+    { color:#FFFFFF; }
     body {
       padding: 24px;
       display: flex;
