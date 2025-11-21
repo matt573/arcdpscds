@@ -998,7 +998,7 @@ app.get('/', (req, res) => {
         </div>
 
         <p class="hero-note">
-          Place <code>arcdps_cooldowns.dll</code> in your GW2 main folder next to <code>arcdps.dll</code>.
+          Place <code>arcdps_cooldowns.dll</code> in your GW2 main folder next to <code><a href="https://www.deltaconnected.com/arcdps/x64/d3d11.dll">d3d11.dll</a></code>.
           The plugin will <strong>auto-update</strong> when new versions are available.
         </p>
 
