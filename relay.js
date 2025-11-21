@@ -292,7 +292,7 @@ app.get('/', (req, res) => {
     * {
       box-sizing: border-box;
     }
-
+html {zoom: 1.2;}
     html, body {
       margin: 0;
       padding: 0;
