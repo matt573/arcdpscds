@@ -6,6 +6,7 @@
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ole32.lib")
 
+
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 #include <stdint.h>
@@ -29,7 +30,7 @@ using json = nlohmann::json;
 
 static constexpr uint32_t PLUGIN_SIG = 0xC0CD0F15;
 static const char* PLUGIN_NAME = "Squad Cooldowns";
-static const char* PLUGIN_VER = "1.03";
+static const char* PLUGIN_VER = "1.04";
 
 static constexpr uint32_t BUFF_ALACRITY = 30328;
 static constexpr uint32_t BUFF_CHILL = 722;
@@ -48,6 +49,10 @@ static constexpr uint32_t BUFF_CHILL = 722;
 
 #ifndef CBTS_LOGEND
 #define CBTS_LOGEND 10
+#endif
+
+#ifndef CBTS_CHANGEUP
+#define CBTS_CHANGEUP 3
 #endif
 
 #ifndef ACTV_NONE
@@ -82,8 +87,10 @@ static std::string g_server_host = "relay.ethevia.com";
 static int g_server_port = 443;
 static bool g_use_https = true;
 
-static constexpr float NET_OFFSET = 3.5f;
+static constexpr float NET_OFFSET = 1.75f;
 static constexpr float CANCEL_COOLDOWN = 1.5f;
+static constexpr int PUSH_INTERVAL_MS = 150;  // how often we POST /update
+static constexpr int PULL_INTERVAL_MS = 300;  // how often we GET /aggregate
 
 static inline double now_s() {
     using clock = std::chrono::steady_clock;
@@ -124,7 +131,6 @@ struct SlotTimer {
     double cancel_start_s = -1.0;
 
     void on_cast(double now_s_val) {
-        // Real cast -> normal cooldown
         last_cast_s = now_s_val;
         last_update_s = now_s_val;
         elapsed = 0.f;
@@ -133,7 +139,6 @@ struct SlotTimer {
     }
 
     void start_cancel_cd(double now_s_val) {
-        // Cancelled cast -> short fake cooldown, independent of base_cd
         last_cast_s = -1.0;
         last_update_s = -1.0;
         elapsed = 0.f;
@@ -142,7 +147,6 @@ struct SlotTimer {
     }
 
     void advance(double now_s_val, bool has_alac, bool has_chill) {
-        // Fake cancel cooldown is handled entirely in predict_left
         if (cancel_active)
             return;
 
@@ -152,27 +156,44 @@ struct SlotTimer {
         double dt = now_s_val - last_update_s;
         if (dt <= 0.0) return;
 
-        float speed = 1.0f;
-        if (has_alac)  speed *= 1.25f;
-        if (has_chill) speed *= 0.60f;
+        // Base = 1.0 → 1 second of cooldown removed per 1s real time.
+        // Alac: +25% recharge rate → +0.25
+        // Chill: -66% recharge rate → -0.66
+        // Combined: 1.0 + 0.25 - 0.66 = 0.59
+        float rate = 1.0f;
 
-        elapsed += float(dt * speed);
+        if (has_alac && has_chill) {
+            rate = 0.753f;      // both at once
+        }
+        else if (has_alac) {
+            rate = 1.25f;       // alacrity only
+        }
+        else if (has_chill) {
+            rate = 0.602f;      // chill only
+        }
+        else {
+            rate = 1.0f;        // no modifiers
+        }
+
+        elapsed += float(dt * rate);
         if (elapsed > base_cd) elapsed = base_cd;
 
         last_update_s = now_s_val;
     }
 
-    float predict_left(double now_s_val, bool has_alac, bool has_chill) {
+
+    // RAW remaining time, no NET_OFFSET. This returns:
+    // - for cancel_active: 0..CANCEL_COOLDOWN
+    // - for normal: remaining cooldown in seconds
+    float predict_left_raw(double now_s_val, bool has_alac, bool has_chill) {
         // --- Fake cancel cooldown path (no boon scaling) ---
         if (cancel_active) {
             if (cancel_start_s < 0.0) {
-                // Shouldn’t happen, but treat as ready
                 return 0.f;
             }
 
             double dt = now_s_val - cancel_start_s;
             if (dt >= CANCEL_COOLDOWN) {
-                // Stay in "cancel mode" but report 0s left -> READY
                 return 0.f;
             }
 
@@ -189,10 +210,10 @@ struct SlotTimer {
         float remaining = base_cd - elapsed;
         if (remaining <= 0.f) return 0.f;
 
-        float left = remaining - NET_OFFSET;
-        return left < 0.f ? 0.f : left;
+        return remaining;
     }
 };
+
 
 
 
@@ -208,6 +229,7 @@ struct SelfContext {
     bool has_alacrity = false;
     bool has_chill = false;
     uint32_t subgroup = 0;
+    uint32_t elite = 0;    // NEW: current elite spec id
 };
 
 struct PeerEntry {
@@ -221,6 +243,7 @@ struct Peer {
     std::string name;
     std::string account;
     uint32_t prof = 0;
+    uint32_t elite = 0;
     uint32_t subgroup = 0;
     std::vector<PeerEntry> entries;
 };
@@ -229,9 +252,28 @@ static std::mutex g_mutex;
 static SelfContext g_self;
 static std::unordered_map<uint32_t, SlotTimer> g_by_skill;
 
+static double g_alac_until_s = 0.0;
+static double g_chill_until_s = 0.0;
+
 static void advance_all_timers_locked(double now_s_val) {
-    const bool has_alac = g_self.has_alacrity;
-    const bool has_chill = g_self.has_chill;
+    // Start from current flags
+    bool has_alac = g_self.has_alacrity;
+    bool has_chill = g_self.has_chill;
+
+    // Expire Alacrity if its timeout passed
+    if (has_alac && g_alac_until_s > 0.0 && now_s_val >= g_alac_until_s) {
+        has_alac = false;
+        g_self.has_alacrity = false;
+        g_alac_until_s = 0.0;
+    }
+
+    // Expire Chill if its timeout passed
+    if (has_chill && g_chill_until_s > 0.0 && now_s_val >= g_chill_until_s) {
+        has_chill = false;
+        g_self.has_chill = false;
+        g_chill_until_s = 0.0;
+    }
+
     for (auto& kv : g_by_skill) {
         kv.second.advance(now_s_val, has_alac, has_chill);
     }
@@ -312,6 +354,85 @@ static const char* prof_name(uint32_t prof) {
     default: return "Unknown";
     }
 }
+
+static const char* icon_for_prof_elite(uint32_t prof, uint32_t elite) {
+    switch (elite) {
+        // Guardian 
+    case 27:  return "?"; // Dragonhunter
+    case 62:  return "?"; // Firebrand
+    case 65:  return "?"; // Willbender
+    case 81:  return "?"; // Luminary 
+
+        // Warrior 
+    case 18:  return "?"; // Berserker
+    case 61:  return "?"; // Spellbreaker
+    case 68:  return "?"; // Bladesworn
+    case 74:  return "?"; // Paragon 
+
+        // Engineer 
+    case 43:  return "?"; // Scrapper
+    case 57:  return "?"; // Holosmith
+    case 70:  return "?"; // Mechanist
+    case 75:  return "?"; // Amalgam 
+
+        // Ranger 
+    case 5:   return "?"; // Druid
+    case 55:  return "?"; // Soulbeast
+    case 72:  return "?"; // Untamed
+    case 78:  return "?"; // Galeshot 
+
+        // Thief 
+    case 7:   return "?"; // Daredevil
+    case 58:  return "?"; // Deadeye
+    case 71:  return "?"; // Specter
+    case 77:  return "?"; // Antiquary 
+
+        // Elementalist 
+    case 48:  return "?"; // Tempest
+    case 56:  return "?"; // Weaver
+    case 67:  return "?"; // Catalyst
+    case 80:  return "?"; // Evoker
+
+        // Mesmer 
+    case 40:  return "?"; // Chronomancer
+    case 59:  return "?"; // Mirage
+    case 66:  return "?"; // Virtuoso
+    case 73:  return "?"; // Troubadour
+
+        // Necromancer 
+    case 34:  return "?"; // Reaper
+    case 60:  return "?"; // Scourge
+    case 64:  return "?"; // Harbinger
+    case 76:  return "?"; // Ritualist 
+
+        // Revenant 
+    case 52:  return "?"; // Herald
+    case 63:  return "?"; // Renegade
+    case 69:  return "?"; // Vindicator
+    case 79:  return "?"; // Conduit 
+
+
+    default:
+        break;
+    }
+
+    // Fallback
+    switch (prof) {
+    case 1:  return "?"; // Guardian 
+    case 2:  return "?"; // Warrior 
+    case 3:  return "?"; // Engineer 
+    case 4:  return "?"; // Ranger 
+    case 5:  return "?"; // Thief 
+    case 6:  return "?"; // Elementalist 
+    case 7:  return "?"; // Mesmer 
+    case 8:  return "?"; // Necromancer 
+    case 9:  return "?"; // Revenant 
+    default: return "?";
+    }
+}
+
+
+
 
 static std::wstring dll_dir() {
     wchar_t buf[MAX_PATH];
@@ -636,16 +757,17 @@ static float get_base_cd_for_skill(uint32_t sid, float row_base) {
 }
 
 
-static float compute_left_for(uint32_t sid, float row_base, double now) {
+// INTERNAL: raw computation with optional net_offset
+static float compute_left_for_internal(uint32_t sid, float row_base, double now, float net_offset) {
     auto it = g_by_skill.find(sid);
     if (it == g_by_skill.end()) return -1.f;
 
     SlotTimer& st = it->second;
 
-    // --- Fake cancel cooldown path: ignore base_cd completely ---
+    // --- Cancel path: ignore NET_OFFSET entirely ---
     if (st.cancel_active) {
-        // no boon scaling on cancel-cooldown
-        return st.predict_left(now, false, false);
+        // cancel cooldown is short and purely client-side
+        return st.predict_left_raw(now, false, false);
     }
 
     // --- Normal cooldown path (needs a valid base_cd) ---
@@ -654,11 +776,47 @@ static float compute_left_for(uint32_t sid, float row_base, double now) {
 
     st.base_cd = base;
 
-    const bool has_alac = g_self.has_alacrity;
-    const bool has_chill = g_self.has_chill;
+    // NOTE: this function is always called with g_mutex already locked
+    bool has_alac = g_self.has_alacrity;
+    bool has_chill = g_self.has_chill;
 
-    return st.predict_left(now, has_alac, has_chill);
+    // Expire Alacrity at query time if needed
+    if (has_alac && g_alac_until_s > 0.0 && now >= g_alac_until_s) {
+        has_alac = false;
+        g_self.has_alacrity = false;
+        g_alac_until_s = 0.0;
+    }
+
+    // Expire Chill at query time if needed
+    if (has_chill && g_chill_until_s > 0.0 && now >= g_chill_until_s) {
+        has_chill = false;
+        g_self.has_chill = false;
+        g_chill_until_s = 0.0;
+    }
+
+    float remaining = st.predict_left_raw(now, has_alac, has_chill);
+    if (remaining < 0.f) return remaining;
+
+    if (net_offset <= 0.f) {
+        // local: no fudging
+        return remaining;
+    }
+
+    float left = remaining - net_offset;
+    if (left < 0.f) left = 0.f;
+    return left;
 }
+
+// Local UI: no network fudge
+static float compute_left_for_local(uint32_t sid, float row_base, double now) {
+    return compute_left_for_internal(sid, row_base, now, 0.0f);
+}
+
+// Shared/relay: apply NET_OFFSET for early "ready"
+static float compute_left_for_shared(uint32_t sid, float row_base, double now) {
+    return compute_left_for_internal(sid, row_base, now, NET_OFFSET);
+}
+
 
 
 static bool is_probable_junk_name(const char* nm) {
@@ -690,6 +848,8 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
             g_dead_accounts.clear();
             g_self.has_alacrity = false;
             g_self.has_chill = false;
+            g_alac_until_s = 0.0;
+            g_chill_until_s = 0.0;
             return;
         }
 
@@ -699,6 +859,7 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
             g_self_prof = dst->prof;
             g_self.self_instid = dst->id;
             g_self.subgroup = dst->team;
+            g_self.elite = dst->elite;   // read elite spec from Arc
 
             if (src && src->name && *src->name) {
                 g_self_charname = src->name;
@@ -733,39 +894,114 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
     g_last_ev_ms = ev->time;
     const double now = now_s();
 
-    // ---- CLEAR ALAC/CHILL ON DOWN/DEAD/EXIT/LOGEND ----
-    if ((ev->is_statechange == CBTS_CHANGEDOWN ||
-        ev->is_statechange == CBTS_CHANGEDEAD) &&
-        dst && dst->self) {
+    // ---- DOWN / DEAD / UP TRACKING (for greying + self boon clear) ----
+    if (ev->is_statechange == CBTS_CHANGEDOWN ||
+        ev->is_statechange == CBTS_CHANGEDEAD ||
+        ev->is_statechange == CBTS_CHANGEUP) {
 
         std::scoped_lock lk(g_mutex);
-        g_self.has_alacrity = false;
-        g_self.has_chill = false;
+
+        // Arc usually puts the changing agent in src, but fall back to dst just in case.
+        ag* a = src ? src : dst;
+        if (a && a->name && *a->name) {
+            const std::string key = a->name;
+
+            if (ev->is_statechange == CBTS_CHANGEDOWN ||
+                ev->is_statechange == CBTS_CHANGEDEAD) {
+                // Mark as down/dead for UI grey-out
+                g_dead_accounts.insert(key);
+
+                // If it's us, finalize timers under old boon state and clear boons
+                if (a->self) {
+                    advance_all_timers_locked(now);
+                    g_self.has_alacrity = false;
+                    g_self.has_chill = false;
+                    g_alac_until_s = 0.0;
+                    g_chill_until_s = 0.0;
+                }
+            }
+            else if (ev->is_statechange == CBTS_CHANGEUP) {
+                // Back up -> remove from dead set
+                g_dead_accounts.erase(key);
+            }
+        }
     }
 
+    // ---- CLEAR ALAC/CHILL ON EXITCOMBAT / LOGEND ----
     if ((ev->is_statechange == CBTS_EXITCOMBAT ||
         ev->is_statechange == CBTS_LOGEND) &&
         dst && dst->self) {
 
         std::scoped_lock lk(g_mutex);
+
+        // Apply old boon state up to 'now'
+        advance_all_timers_locked(now);
+
         g_self.has_alacrity = false;
         g_self.has_chill = false;
+        g_alac_until_s = 0.0;
+        g_chill_until_s = 0.0;
+
     }
 
     // ---- TRACK ALAC / CHILL BUFFS ----
     if (ev->is_statechange == CBTS_NONE &&
-        ev->is_buff == 1 &&
-        dst && dst->self) {
+        dst && dst->self &&
+        (ev->skillid == BUFF_ALACRITY || ev->skillid == BUFF_CHILL)) {
 
         std::scoped_lock lk(g_mutex);
 
-        if (ev->skillid == BUFF_ALACRITY) {
-            g_self.has_alacrity = (ev->is_buffremove == 0);
+        // First advance using *previous* boon state
+        advance_all_timers_locked(now);
+
+        // Many buff events have duration in ms in ev->value, but not all.
+        double dur_s = 0.0;
+        if (ev->value > 0) {
+            dur_s = (double)ev->value / 1000.0;
         }
-        else if (ev->skillid == BUFF_CHILL) {
-            g_self.has_chill = (ev->is_buffremove == 0);
+
+        if (ev->skillid == BUFF_ALACRITY) {
+            if (ev->is_buffremove == 0) {
+                // Alacrity applied / refreshed
+                g_self.has_alacrity = true;
+
+                // If we got a duration, remember it; otherwise 0 means “unknown”
+                if (dur_s > 0.0) {
+                    g_alac_until_s = now + dur_s;
+                }
+                else {
+                    g_alac_until_s = 0.0; // rely on explicit buffremove/exitcombat/down
+                }
+            }
+            else {
+                // Alacrity removed / strips / full clear
+                g_self.has_alacrity = false;
+                g_alac_until_s = 0.0;
+            }
+        }
+        else { // BUFF_CHILL
+            if (ev->is_buffremove == 0) {
+                // Chill applied / refreshed
+                g_self.has_chill = true;
+
+                // Chill is usually short. If the event has no duration, fall back to a
+                // small timeout so it can NEVER get stuck “on”.
+                if (dur_s <= 0.0) {
+                    dur_s = 3.0; // conservative fallback, tweak if you want
+                }
+                g_chill_until_s = now + dur_s;
+            }
+            else {
+                // Chill removed / expired / cleansed
+                g_self.has_chill = false;
+                g_chill_until_s = 0.0;
+            }
         }
     }
+
+    // --------------------------------------------------------------------
+    // From here down: your existing self/pick/cooldown logic unchanged
+    // --------------------------------------------------------------------
 
     const bool is_self = ((src && src->self) || (dst && dst->self));
     bool picked = false;
@@ -925,7 +1161,7 @@ static void parse_peers_from_json_locked(const json& jr) {
         else {
             p.id.clear();
         }
-
+        p.elite = pj.value("elite", 0u);
         p.prof = pj.value("prof", 0u);
         p.subgroup = pj.value("subgroup", 0u);
 
@@ -1022,7 +1258,8 @@ static void inject_self_if_missing_locked() {
 
     for (auto& e : g_tracked) {
         if (!e.enabled || e.skillid == 0) continue;
-        float left = compute_left_for(e.skillid, e.base_cd, now);
+        float left = compute_left_for_local(e.skillid, e.base_cd, now);
+
         PeerEntry pe;
         pe.label = e.label;
         pe.ready = (left >= 0.f && left <= 0.5f) || (g_by_skill.find(e.skillid) == g_by_skill.end());
@@ -1050,7 +1287,7 @@ static void net_loop() {
 
         // ---- PUSH /update ----
         if (g_share_enabled &&
-            std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - last_push).count() >= 500) {
+            std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - last_push).count() >= PUSH_INTERVAL_MS) {
 
             last_push = now_tp;
             {
@@ -1075,6 +1312,10 @@ static void net_loop() {
                 payload["name"] = (!g_self_charname.empty() ? g_self_charname : g_assigned_name);
                 payload["prof"] = g_self_prof;
                 payload["subgroup"] = g_self.subgroup;
+
+                payload["elite"] = g_self.elite;
+
+
                 if (!g_self_accountname.empty()) {
                     payload["account"] = g_self_accountname;
                 }
@@ -1102,7 +1343,8 @@ static void net_loop() {
                 for (auto& e : g_tracked) {
                     if (!e.enabled || e.skillid == 0) continue;
 
-                    float left = compute_left_for(e.skillid, e.base_cd, now);
+                    float left = compute_left_for_shared(e.skillid, e.base_cd, now);
+
                     const bool ready =
                         (left >= 0.f && left <= 0.5f) ||
                         (g_by_skill.find(e.skillid) == g_by_skill.end());
@@ -1139,7 +1381,7 @@ static void net_loop() {
         }
 
         // ---- PULL /aggregate ----
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - last_pull).count() >= 1000) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - last_pull).count() >= PULL_INTERVAL_MS) {
             last_pull = now_tp;
             std::wstring qp = L"/aggregate?room=" + std::wstring(g_room.begin(), g_room.end());
             std::string resp;
@@ -1154,11 +1396,7 @@ static void net_loop() {
                         inject_self_if_missing_locked();
                     }
 
-                    char buf[128];
-                    std::snprintf(buf, sizeof(buf),
-                        "[sqcd] aggregate parsed peers=%zu",
-                        (size_t)g_peers.size());
-                    arc_log(buf);
+                    
                 }
                 catch (const std::exception& e) {
                     char buf[256];
@@ -1201,6 +1439,7 @@ static void move_peer_down_in_group(uint32_t prof, const std::string& id) {
         return;
     }
 }
+
 
 static void draw_tracked_ui() {
     static bool  s_prev_open = false;
@@ -1291,7 +1530,7 @@ static void draw_tracked_ui() {
             ImGui::TableSetColumnIndex(3);
             {
                 float left = -1.f;
-                if (e.skillid) left = compute_left_for(e.skillid, e.base_cd, now);
+                if (e.skillid) left = compute_left_for_local(e.skillid, e.base_cd, now);
 
                 if (e.skillid == 0) {
                     ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "no skill");
@@ -1365,6 +1604,8 @@ static void draw_tracked_ui() {
     s_prev_open = true;
 }
 
+
+
 static const ImVec4 SEP_COLOR(0.8f, 0.8f, 0.8f, 0.8f);
 
 static void draw_group_table(uint32_t prof, const std::vector<Peer>& peers_snapshot) {
@@ -1423,6 +1664,7 @@ static void draw_group_table(uint32_t prof, const std::vector<Peer>& peers_snaps
     }
 
     ImVec4 base_color = prof_color(prof);
+    const ImVec4 disabled_color = ImGui::GetStyle().Colors[ImGuiCol_TextDisabled];
 
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(3.0f, 1.0f));
 
@@ -1433,39 +1675,47 @@ static void draw_group_table(uint32_t prof, const std::vector<Peer>& peers_snaps
 
     std::string table_id = "squad_prof_" + std::to_string(prof);
     if (ImGui::BeginTable(table_id.c_str(), 4, flags)) {
-        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 18.0f);
+        ImGui::TableSetupColumn("Prof", ImGuiTableColumnFlags_WidthFixed, 22.0f);
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 100.0f);
         ImGui::TableSetupColumn("Skills", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Re", ImGuiTableColumnFlags_WidthFixed, 60.0f);
 
         int row = 0;
-
         for (const Peer* p : ordered) {
             ImGui::TableNextRow();
 
+            // Row index
             ImGui::TableSetColumnIndex(0);
             ImGui::Text("%d", ++row);
 
+            // Determine dead/down state ONCE per peer
             bool is_dead = false;
             if (!p->account.empty() && dead_accounts_snapshot.count(p->account))
                 is_dead = true;
             else if (!p->name.empty() && dead_accounts_snapshot.count(p->name))
                 is_dead = true;
 
-            ImVec4 name_color = base_color;
-            if (is_dead) {
-                name_color = ImGui::GetStyle().Colors[ImGuiCol_TextDisabled];
-            }
-
+            // Column 1: name (already greyed when dead)
             ImGui::TableSetColumnIndex(1);
             {
+                ImVec4 name_color = base_color;
+                if (is_dead) {
+                    name_color = disabled_color;
+                }
+
                 const std::string& display_name = !p->name.empty() ? p->name : p->id;
                 ImGui::TextColored(name_color, "%s", display_name.c_str());
             }
 
+            // Column 2: skills / timers (NEW: grey out when dead)
             ImGui::TableSetColumnIndex(2);
             if (p->entries.empty()) {
-                ImGui::TextDisabled("(no data)");
+                if (is_dead) {
+                    ImGui::TextColored(disabled_color, "(no data)");
+                }
+                else {
+                    ImGui::TextDisabled("(no data)");
+                }
             }
             else {
                 for (size_t i = 0; i < p->entries.size(); ++i) {
@@ -1478,25 +1728,38 @@ static void draw_group_table(uint32_t prof, const std::vector<Peer>& peers_snaps
                     }
 
                     if (e.ready) {
-                        ImGui::TextColored(ImVec4(0.60f, 1.00f, 0.60f, 1.00f), "%s", e.label.c_str());
+                        ImVec4 col = is_dead
+                            ? disabled_color
+                            : ImVec4(0.60f, 1.00f, 0.60f, 1.00f);
+                        ImGui::TextColored(col, "%s", e.label.c_str());
                     }
                     else if (e.left >= 0.f) {
                         if (e.left < 10.0f) {
+                            ImVec4 col = is_dead
+                                ? disabled_color
+                                : ImVec4(1.00f, 0.80f, 0.40f, 1.00f);
                             ImGui::TextColored(
-                                ImVec4(1.00f, 0.80f, 0.40f, 1.00f),
+                                col,
                                 "%s %.0fs", e.label.c_str(), e.left
                             );
                         }
                         else {
-                            ImGui::Text("%s %.0fs", e.label.c_str(), e.left);
+                            if (is_dead) {
+                                ImGui::TextColored(disabled_color, "%s %.0fs", e.label.c_str(), e.left);
+                            }
+                            else {
+                                ImGui::Text("%s %.0fs", e.label.c_str(), e.left);
+                            }
                         }
                     }
                     else {
+                        // Unknown / waiting – already "disabled"-style; dead keeps it grey anyway
                         ImGui::TextDisabled("%s ?", e.label.c_str());
                     }
                 }
             }
 
+            // Column 3: reorder arrows (unchanged)
             ImGui::TableSetColumnIndex(3);
             const std::string up_id = "up##" + p->id;
             const std::string dn_id = "dn##" + p->id;
@@ -1516,6 +1779,7 @@ static void draw_group_table(uint32_t prof, const std::vector<Peer>& peers_snaps
     ImGui::PopStyleVar();
     ImGui::Spacing();
 }
+
 
 static void draw_squad_ui() {
     std::vector<Peer> peers_snapshot;
