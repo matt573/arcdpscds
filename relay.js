@@ -655,6 +655,7 @@ a:link, a:visited, a:hover, a:active
     .section-inner {
       position: relative;
       z-index: 1;
+      visibility:hidden;
     }
 
     .section-header {
