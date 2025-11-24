@@ -30,7 +30,7 @@ using json = nlohmann::json;
 
 static constexpr uint32_t PLUGIN_SIG = 0xC0CD0F15;
 static const char* PLUGIN_NAME = "Squad Cooldowns";
-static const char* PLUGIN_VER = "1.06";
+static const char* PLUGIN_VER = "1.07";
 
 static constexpr uint32_t BUFF_ALACRITY = 30328;
 static constexpr uint32_t BUFF_CHILL = 722;
@@ -894,25 +894,34 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
 
     g_last_ev_ms = ev->time;
     const double now = now_s();
+    // This heals cases where we missed a CHANGEUP or log reset.
+    if (ev->is_statechange == CBTS_NONE) {
+        std::scoped_lock lk(g_mutex);
+        if (src && src->name && *src->name) {
+            g_dead_accounts.erase(src->name);
+        }
+        if (dst && dst->name && *dst->name) {
+            g_dead_accounts.erase(dst->name);
+        }
+    }
 
-   // Downstate / Dead 
+    // Downstate / Dead
     if (ev->is_statechange == CBTS_CHANGEDOWN ||
         ev->is_statechange == CBTS_CHANGEDEAD ||
         ev->is_statechange == CBTS_CHANGEUP) {
 
         std::scoped_lock lk(g_mutex);
 
-        
-        ag* a = src ? src : dst;
+       
+        ag* a = dst ? dst : src;
         if (a && a->name && *a->name) {
             const std::string key = a->name;
 
             if (ev->is_statechange == CBTS_CHANGEDOWN ||
                 ev->is_statechange == CBTS_CHANGEDEAD) {
-                // Mark as Downstate / Dead
+               
                 g_dead_accounts.insert(key);
 
-                
                 if (a->self) {
                     advance_all_timers_locked(now);
                     g_self.has_alacrity = false;
@@ -922,7 +931,7 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
                 }
             }
             else if (ev->is_statechange == CBTS_CHANGEUP) {
-               
+              
                 g_dead_accounts.erase(key);
             }
         }
@@ -943,6 +952,11 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
         g_alac_until_s = 0.0;
         g_chill_until_s = 0.0;
 
+    }
+    // When a log/encounter fully ends, wipe dead markers so next pull is clean.
+    if (ev->is_statechange == CBTS_LOGEND) {
+        std::scoped_lock lk(g_mutex);
+        g_dead_accounts.clear();
     }
 
     // ALAC / CHILL, TIGHTEN UP LOGIC
@@ -1047,7 +1061,7 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
 
        
         if (ev->skillid != 0 &&
-            ev->is_buff == 0 &&
+            ev->is_activation != ACTV_NONE &&
             !is_probable_junk_name(skillname)) {
 
             const uint32_t sid = ev->skillid;
@@ -1283,22 +1297,23 @@ static void net_loop() {
     while (g_net_alive) {
         auto now_tp = std::chrono::steady_clock::now();
 
-        
+        // 1) ALWAYS process pending API cooldown lookups
+        {
+            uint32_t sid;
+            while (pop_next_cd_request(sid)) {
+                float cd = fetch_skill_recharge_api(sid);
+                if (cd > 0.f) {
+                    std::lock_guard<std::mutex> lk(g_cd_cache_mutex);
+                    g_api_cd_cache[sid] = cd;
+                }
+            }
+        }
+
+        // 2) Only push to the relay if sharing is enabled
         if (g_share_enabled &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - last_push).count() >= PUSH_INTERVAL_MS) {
 
             last_push = now_tp;
-            {
-                uint32_t sid;
-                
-                while (pop_next_cd_request(sid)) {
-                    float cd = fetch_skill_recharge_api(sid);  
-                    if (cd > 0.f) {
-                        std::scoped_lock lk(g_mutex);
-                        g_api_cd_cache[sid] = cd;
-                    }
-                }
-            }
 
             json payload;
             payload["room"] = g_room;
@@ -1310,10 +1325,7 @@ static void net_loop() {
                 payload["name"] = (!g_self_charname.empty() ? g_self_charname : g_assigned_name);
                 payload["prof"] = g_self_prof;
                 payload["subgroup"] = g_self.subgroup;
-
                 payload["elite"] = g_self.elite;
-
-
                 if (!g_self_accountname.empty()) {
                     payload["account"] = g_self_accountname;
                 }
@@ -1332,17 +1344,15 @@ static void net_loop() {
                     g_group_order_dirty.clear();
                 }
             }
+
             payload["entries"] = json::array();
-
-            double now = now_s();
-
             {
                 std::scoped_lock lk(g_mutex);
+                double now = now_s();
                 for (auto& e : g_tracked) {
                     if (!e.enabled || e.skillid == 0) continue;
 
                     float left = compute_left_for_shared(e.skillid, e.base_cd, now);
-
                     const bool ready =
                         (left >= 0.f && left <= 0.5f) ||
                         (g_by_skill.find(e.skillid) == g_by_skill.end());
@@ -1690,8 +1700,7 @@ static void draw_group_table(uint32_t prof, const std::vector<Peer>& peers_snaps
             bool is_dead = false;
             if (!p->account.empty() && dead_accounts_snapshot.count(p->account))
                 is_dead = true;
-            else if (!p->name.empty() && dead_accounts_snapshot.count(p->name))
-                is_dead = true;
+           
 
 
             ImGui::TableSetColumnIndex(1);
@@ -1812,7 +1821,6 @@ static void draw_squad_ui() {
 
             bool in_squad = false;
 
-            
             if (!p.account.empty() &&
                 squad_accounts.find(p.account) != squad_accounts.end()) {
                 in_squad = true;
