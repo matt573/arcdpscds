@@ -20,8 +20,8 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include <cstdio>
 #include <algorithm>
 #include <map>
-#include <exception> // std::exception
-#include <cmath>     // fabsf
+#include <exception> // for std::exception
+#include <cmath>     // for fabsf
 
 #include "imgui.h"
 #include "arcdps_structs.h"
@@ -30,7 +30,7 @@ using json = nlohmann::json;
 
 static constexpr uint32_t PLUGIN_SIG = 0xC0CD0F15;
 static const char* PLUGIN_NAME = "Squad Cooldowns";
-static const char* PLUGIN_VER = "1.07";
+static const char* PLUGIN_VER = "1.09";
 
 static constexpr uint32_t BUFF_ALACRITY = 30328;
 static constexpr uint32_t BUFF_CHILL = 722;
@@ -79,7 +79,6 @@ static std::unordered_map<uint32_t, float> g_hard_override_cd = {
     { 12569, 120.f },
     { 62965, 20.f },
     { 10545, 40.f },
-    { 14419, 120.f },
 };
 
 static bool g_share_enabled = true;
@@ -90,8 +89,8 @@ static bool g_use_https = true;
 
 static constexpr float NET_OFFSET = 1.75f;
 static constexpr float CANCEL_COOLDOWN = 1.5f;
-static constexpr int PUSH_INTERVAL_MS = 150;  //  POST /update
-static constexpr int PULL_INTERVAL_MS = 300;  //  GET /aggregate
+static constexpr int PUSH_INTERVAL_MS = 150;  // how often we POST /update
+static constexpr int PULL_INTERVAL_MS = 300;  // how often we GET /aggregate
 
 static inline double now_s() {
     using clock = std::chrono::steady_clock;
@@ -99,14 +98,14 @@ static inline double now_s() {
     return std::chrono::duration<double>(clock::now() - t0).count();
 }
 
-
+// Pending CD fetch requests (non-blocking for main thread)
 static std::mutex g_cd_mutex;
 static std::unordered_set<uint32_t> g_cd_pending;
 
 
 static void request_cd_fetch(uint32_t sid) {
     std::lock_guard<std::mutex> lk(g_cd_mutex);
-    g_cd_pending.insert(sid);  
+    g_cd_pending.insert(sid);  // set semantics: no duplicates
 }
 
 static bool pop_next_cd_request(uint32_t& out_sid) {
@@ -164,16 +163,16 @@ struct SlotTimer {
         float rate = 1.0f;
 
         if (has_alac && has_chill) {
-            rate = 0.753f;      
+            rate = 0.753f;      // both at once
         }
         else if (has_alac) {
-            rate = 1.25f;       
+            rate = 1.25f;       // alacrity only
         }
         else if (has_chill) {
-            rate = 0.602f;      
+            rate = 0.602f;      // chill only
         }
         else {
-            rate = 1.0f;       
+            rate = 1.0f;        // no modifiers
         }
 
         elapsed += float(dt * rate);
@@ -183,9 +182,11 @@ struct SlotTimer {
     }
 
 
-    
+    // RAW remaining time, no NET_OFFSET. This returns:
+    // - for cancel_active: 0..CANCEL_COOLDOWN
+    // - for normal: remaining cooldown in seconds
     float predict_left_raw(double now_s_val, bool has_alac, bool has_chill) {
-        
+        // --- Fake cancel cooldown path (no boon scaling) ---
         if (cancel_active) {
             if (cancel_start_s < 0.0) {
                 return 0.f;
@@ -201,7 +202,7 @@ struct SlotTimer {
             return left;
         }
 
-        
+        // --- Normal cooldown path ---
         advance(now_s_val, has_alac, has_chill);
 
         if (last_cast_s < 0 || base_cd <= 0) return -1.f;
@@ -228,7 +229,7 @@ struct SelfContext {
     bool has_alacrity = false;
     bool has_chill = false;
     uint32_t subgroup = 0;
-    uint32_t elite = 0;    
+    uint32_t elite = 0;    // NEW: current elite spec id
 };
 
 struct PeerEntry {
@@ -255,17 +256,18 @@ static double g_alac_until_s = 0.0;
 static double g_chill_until_s = 0.0;
 
 static void advance_all_timers_locked(double now_s_val) {
-   
+    // Start from current flags
     bool has_alac = g_self.has_alacrity;
     bool has_chill = g_self.has_chill;
 
-    
+    // Expire Alacrity if its timeout passed
     if (has_alac && g_alac_until_s > 0.0 && now_s_val >= g_alac_until_s) {
         has_alac = false;
         g_self.has_alacrity = false;
         g_alac_until_s = 0.0;
     }
 
+    // Expire Chill if its timeout passed
     if (has_chill && g_chill_until_s > 0.0 && now_s_val >= g_chill_until_s) {
         has_chill = false;
         g_self.has_chill = false;
@@ -352,8 +354,6 @@ static const char* prof_name(uint32_t prof) {
     default: return "Unknown";
     }
 }
-
-// To be finished, prof icons
 
 static const char* icon_for_prof_elite(uint32_t prof, uint32_t elite) {
     switch (elite) {
@@ -643,13 +643,13 @@ cleanup:
     return ok;
 }
 
-
+// -------------------- JSON helper --------------------
 
 static bool parse_root_object(const std::string& resp_raw, json& jr) {
     try {
         if (resp_raw.empty()) return false;
 
-        
+        // Strip any embedded NULs just in case
         std::string resp;
         resp.reserve(resp_raw.size());
         for (unsigned char c : resp_raw) {
@@ -681,10 +681,10 @@ static bool parse_root_object(const std::string& resp_raw, json& jr) {
     return false;
 }
 
+// -----------------------------------------------------
 
 static std::unordered_map<uint32_t, float> g_api_cd_cache;
 static std::unordered_set<uint32_t> g_api_cd_tried;
-static std::mutex g_cd_cache_mutex;
 
 static float parse_recharge_from_skill_json(const json& j) {
     if (j.contains("facts") && j["facts"].is_array()) {
@@ -735,60 +735,59 @@ static float fetch_skill_recharge_api(uint32_t skillid) {
 }
 
 static float get_base_cd_for_skill(uint32_t sid, float row_base) {
-   
+    // 1) hard override wins
     auto itH = g_hard_override_cd.find(sid);
     if (itH != g_hard_override_cd.end())
         return itH->second;
 
-  
+    // 2) explicit row base (manual override)
     if (row_base > 0.f)
         return row_base;
 
-   
-    {
-        std::lock_guard<std::mutex> lk(g_cd_cache_mutex);
-        auto it = g_api_cd_cache.find(sid);
-        if (it != g_api_cd_cache.end())
-            return it->second;
-    }
+    // 3) cached from previous API fetch
+    auto it = g_api_cd_cache.find(sid);
+    if (it != g_api_cd_cache.end())
+        return it->second;
 
-    
+    // 4) not known yet -> ask background thread to fetch it
     request_cd_fetch(sid);
+
+    // non-blocking: return 0 for "unknown" so caller can show "waiting"
     return 0.f;
 }
 
 
-
+// INTERNAL: raw computation with optional net_offset
 static float compute_left_for_internal(uint32_t sid, float row_base, double now, float net_offset) {
     auto it = g_by_skill.find(sid);
     if (it == g_by_skill.end()) return -1.f;
 
     SlotTimer& st = it->second;
 
-    
+    // --- Cancel path: ignore NET_OFFSET entirely ---
     if (st.cancel_active) {
-       
+        // cancel cooldown is short and purely client-side
         return st.predict_left_raw(now, false, false);
     }
 
-    
+    // --- Normal cooldown path (needs a valid base_cd) ---
     const float base = get_base_cd_for_skill(sid, row_base);
     if (base <= 0.f) return -1.f;
 
     st.base_cd = base;
 
-   
+    // NOTE: this function is always called with g_mutex already locked
     bool has_alac = g_self.has_alacrity;
     bool has_chill = g_self.has_chill;
 
-    
+    // Expire Alacrity at query time if needed
     if (has_alac && g_alac_until_s > 0.0 && now >= g_alac_until_s) {
         has_alac = false;
         g_self.has_alacrity = false;
         g_alac_until_s = 0.0;
     }
 
-    
+    // Expire Chill at query time if needed
     if (has_chill && g_chill_until_s > 0.0 && now >= g_chill_until_s) {
         has_chill = false;
         g_self.has_chill = false;
@@ -799,7 +798,7 @@ static float compute_left_for_internal(uint32_t sid, float row_base, double now,
     if (remaining < 0.f) return remaining;
 
     if (net_offset <= 0.f) {
-       
+        // local: no fudging
         return remaining;
     }
 
@@ -808,12 +807,12 @@ static float compute_left_for_internal(uint32_t sid, float row_base, double now,
     return left;
 }
 
-
+// Local UI: no network fudge
 static float compute_left_for_local(uint32_t sid, float row_base, double now) {
     return compute_left_for_internal(sid, row_base, now, 0.0f);
 }
 
-
+// Shared/relay: apply NET_OFFSET for early "ready"
 static float compute_left_for_shared(uint32_t sid, float row_base, double now) {
     return compute_left_for_internal(sid, row_base, now, NET_OFFSET);
 }
@@ -838,9 +837,9 @@ static bool is_probable_junk_name(const char* nm) {
 static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
     const char* skillname, uint64_t id, uint64_t rev) {
 
-   
+    // ---- IDENTITY / MAP CHANGE HANDSHAKE ----
     if (!ev) {
-        
+        // Full map change / log reset
         if (!src && !dst) {
             std::scoped_lock lk(g_mutex);
             g_in_map_change = true;
@@ -854,13 +853,13 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
             return;
         }
 
-      
+        // Agent info for self
         if (dst && dst->self) {
             std::scoped_lock lk(g_mutex);
             g_self_prof = dst->prof;
             g_self.self_instid = dst->id;
             g_self.subgroup = dst->team;
-            g_self.elite = dst->elite;   
+            g_self.elite = dst->elite;   // read elite spec from Arc
 
             if (src && src->name && *src->name) {
                 g_self_charname = src->name;
@@ -877,7 +876,7 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
         return;
     }
 
-   
+    // ---- SQUAD MEMBERSHIP TRACKING ----
     {
         std::scoped_lock lk(g_mutex);
         g_in_map_change = false;
@@ -894,34 +893,25 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
 
     g_last_ev_ms = ev->time;
     const double now = now_s();
-    // This heals cases where we missed a CHANGEUP or log reset.
-    if (ev->is_statechange == CBTS_NONE) {
-        std::scoped_lock lk(g_mutex);
-        if (src && src->name && *src->name) {
-            g_dead_accounts.erase(src->name);
-        }
-        if (dst && dst->name && *dst->name) {
-            g_dead_accounts.erase(dst->name);
-        }
-    }
 
-    // Downstate / Dead
+    // ---- DOWN / DEAD / UP TRACKING (for greying + self boon clear) ----
     if (ev->is_statechange == CBTS_CHANGEDOWN ||
         ev->is_statechange == CBTS_CHANGEDEAD ||
         ev->is_statechange == CBTS_CHANGEUP) {
 
         std::scoped_lock lk(g_mutex);
 
-       
-        ag* a = dst ? dst : src;
+        // Arc usually puts the changing agent in src, but fall back to dst just in case.
+        ag* a = src ? src : dst;
         if (a && a->name && *a->name) {
             const std::string key = a->name;
 
             if (ev->is_statechange == CBTS_CHANGEDOWN ||
                 ev->is_statechange == CBTS_CHANGEDEAD) {
-               
+                // Mark as down/dead for UI grey-out
                 g_dead_accounts.insert(key);
 
+                // If it's us, finalize timers under old boon state and clear boons
                 if (a->self) {
                     advance_all_timers_locked(now);
                     g_self.has_alacrity = false;
@@ -931,20 +921,20 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
                 }
             }
             else if (ev->is_statechange == CBTS_CHANGEUP) {
-              
+                // Back up -> remove from dead set
                 g_dead_accounts.erase(key);
             }
         }
     }
 
-   
+    // ---- CLEAR ALAC/CHILL ON EXITCOMBAT / LOGEND ----
     if ((ev->is_statechange == CBTS_EXITCOMBAT ||
         ev->is_statechange == CBTS_LOGEND) &&
         dst && dst->self) {
 
         std::scoped_lock lk(g_mutex);
 
-       
+        // Apply old boon state up to 'now'
         advance_all_timers_locked(now);
 
         g_self.has_alacrity = false;
@@ -953,23 +943,18 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
         g_chill_until_s = 0.0;
 
     }
-    // When a log/encounter fully ends, wipe dead markers so next pull is clean.
-    if (ev->is_statechange == CBTS_LOGEND) {
-        std::scoped_lock lk(g_mutex);
-        g_dead_accounts.clear();
-    }
 
-    // ALAC / CHILL, TIGHTEN UP LOGIC
+    // ---- TRACK ALAC / CHILL BUFFS ----
     if (ev->is_statechange == CBTS_NONE &&
         dst && dst->self &&
         (ev->skillid == BUFF_ALACRITY || ev->skillid == BUFF_CHILL)) {
 
         std::scoped_lock lk(g_mutex);
 
-        
+        // First advance using *previous* boon state
         advance_all_timers_locked(now);
 
-        
+        // Many buff events have duration in ms in ev->value, but not all.
         double dur_s = 0.0;
         if (ev->value > 0) {
             dur_s = (double)ev->value / 1000.0;
@@ -977,43 +962,46 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
 
         if (ev->skillid == BUFF_ALACRITY) {
             if (ev->is_buffremove == 0) {
-               
+                // Alacrity applied / refreshed
                 g_self.has_alacrity = true;
 
-               
+                // If we got a duration, remember it; otherwise 0 means “unknown”
                 if (dur_s > 0.0) {
                     g_alac_until_s = now + dur_s;
                 }
                 else {
-                    g_alac_until_s = 0.0; 
+                    g_alac_until_s = 0.0; // rely on explicit buffremove/exitcombat/down
                 }
             }
             else {
-                
+                // Alacrity removed / strips / full clear
                 g_self.has_alacrity = false;
                 g_alac_until_s = 0.0;
             }
         }
-        else { 
+        else { // BUFF_CHILL
             if (ev->is_buffremove == 0) {
-               
+                // Chill applied / refreshed
                 g_self.has_chill = true;
 
-               
+                // Chill is usually short. If the event has no duration, fall back to a
+                // small timeout so it can NEVER get stuck “on”.
                 if (dur_s <= 0.0) {
-                    dur_s = 3.0; 
+                    dur_s = 3.0; // conservative fallback, tweak if you want
                 }
                 g_chill_until_s = now + dur_s;
             }
             else {
-               
+                // Chill removed / expired / cleansed
                 g_self.has_chill = false;
                 g_chill_until_s = 0.0;
             }
         }
     }
 
- 
+    // --------------------------------------------------------------------
+    // From here down: your existing self/pick/cooldown logic unchanged
+    // --------------------------------------------------------------------
 
     const bool is_self = ((src && src->self) || (dst && dst->self));
     bool picked = false;
@@ -1021,7 +1009,7 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
     if (is_self) {
         std::unique_lock<std::mutex> lk(g_mutex);
 
-     
+        // Keep subgroup up to date
         uint32_t team_src = (src ? src->team : 0);
         uint32_t team_dst = (dst ? dst->team : 0);
         uint32_t new_team = team_src ? team_src : team_dst;
@@ -1029,7 +1017,7 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
             g_self.subgroup = new_team;
         }
 
-        
+        // ---- PICK MODE (Add tracked skill) ----
         if (g_pick_row >= 0 && g_pick_row < (int)g_tracked.size()) {
             if (now <= g_pick_armed_until_s) {
                 if (ev->skillid != 0 &&
@@ -1059,9 +1047,9 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
             }
         }
 
-       
+        // ---- COOLDOWN LOGIC WITH ACTIVATION GUARD ----
         if (ev->skillid != 0 &&
-            ev->is_activation != ACTV_NONE &&
+            ev->is_buff == 0 &&
             !is_probable_junk_name(skillname)) {
 
             const uint32_t sid = ev->skillid;
@@ -1069,7 +1057,7 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
             switch (ev->is_activation) {
             case ACTV_START:
             case ACTV_CANCEL_FIRE:
-               
+                // Real cast -> full cooldown
             {
                 SlotTimer& st = g_by_skill[sid];
                 st.skillid = sid;
@@ -1082,7 +1070,7 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
 
             case ACTV_CANCEL_CANCEL:
             case ACTV_RESET:
-               
+                // Cancelled cast -> short fake cooldown
             {
                 SlotTimer& st = g_by_skill[sid];
                 st.skillid = sid;
@@ -1094,7 +1082,7 @@ static void __cdecl on_combat(cbtevent* ev, ag* src, ag* dst,
             break;
 
             default:
-               
+                // ACTV_NONE or others -> ignore for CD
                 break;
             }
         }
@@ -1163,7 +1151,7 @@ static void parse_peers_from_json_locked(const json& jr) {
     auto parse_one = [&](const json& pj) {
         Peer p;
 
-        
+        // ID: clientId preferred, fall back to legacy "id"
         if (pj.contains("clientId") && pj["clientId"].is_string()) {
             p.id = pj["clientId"].get<std::string>();
         }
@@ -1177,7 +1165,7 @@ static void parse_peers_from_json_locked(const json& jr) {
         p.prof = pj.value("prof", 0u);
         p.subgroup = pj.value("subgroup", 0u);
 
-        
+        // name may be null / missing
         if (pj.contains("name") && pj["name"].is_string()) {
             p.name = pj["name"].get<std::string>();
         }
@@ -1185,7 +1173,7 @@ static void parse_peers_from_json_locked(const json& jr) {
             p.name = "unknown";
         }
 
-        
+        // account can be null on old clients
         if (pj.contains("account") && pj["account"].is_string()) {
             p.account = pj["account"].get<std::string>();
         }
@@ -1283,7 +1271,7 @@ static void inject_self_if_missing_locked() {
     ensure_group_membership_locked();
 }
 
-// Net 
+// ----------------- NET LOOP (patched) -----------------
 
 static void net_loop() {
     if (g_client_id.empty()) {
@@ -1297,23 +1285,22 @@ static void net_loop() {
     while (g_net_alive) {
         auto now_tp = std::chrono::steady_clock::now();
 
-        // 1) ALWAYS process pending API cooldown lookups
-        {
-            uint32_t sid;
-            while (pop_next_cd_request(sid)) {
-                float cd = fetch_skill_recharge_api(sid);
-                if (cd > 0.f) {
-                    std::lock_guard<std::mutex> lk(g_cd_cache_mutex);
-                    g_api_cd_cache[sid] = cd;
-                }
-            }
-        }
-
-        // 2) Only push to the relay if sharing is enabled
+        // ---- PUSH /update ----
         if (g_share_enabled &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - last_push).count() >= PUSH_INTERVAL_MS) {
 
             last_push = now_tp;
+            {
+                uint32_t sid;
+                // drain the queue (or you can do just one per loop if you prefer)
+                while (pop_next_cd_request(sid)) {
+                    float cd = fetch_skill_recharge_api(sid);  // blocking is OK here
+                    if (cd > 0.f) {
+                        std::scoped_lock lk(g_mutex);
+                        g_api_cd_cache[sid] = cd;
+                    }
+                }
+            }
 
             json payload;
             payload["room"] = g_room;
@@ -1325,7 +1312,10 @@ static void net_loop() {
                 payload["name"] = (!g_self_charname.empty() ? g_self_charname : g_assigned_name);
                 payload["prof"] = g_self_prof;
                 payload["subgroup"] = g_self.subgroup;
+
                 payload["elite"] = g_self.elite;
+
+
                 if (!g_self_accountname.empty()) {
                     payload["account"] = g_self_accountname;
                 }
@@ -1344,15 +1334,17 @@ static void net_loop() {
                     g_group_order_dirty.clear();
                 }
             }
-
             payload["entries"] = json::array();
+
+            double now = now_s();
+
             {
                 std::scoped_lock lk(g_mutex);
-                double now = now_s();
                 for (auto& e : g_tracked) {
                     if (!e.enabled || e.skillid == 0) continue;
 
                     float left = compute_left_for_shared(e.skillid, e.base_cd, now);
+
                     const bool ready =
                         (left >= 0.f && left <= 0.5f) ||
                         (g_by_skill.find(e.skillid) == g_by_skill.end());
@@ -1388,7 +1380,7 @@ static void net_loop() {
             }
         }
 
-		// /aggregate pull
+        // ---- PULL /aggregate ----
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - last_pull).count() >= PULL_INTERVAL_MS) {
             last_pull = now_tp;
             std::wstring qp = L"/aggregate?room=" + std::wstring(g_room.begin(), g_room.end());
@@ -1404,7 +1396,7 @@ static void net_loop() {
                         inject_self_if_missing_locked();
                     }
 
-                    
+
                 }
                 catch (const std::exception& e) {
                     char buf[256];
@@ -1420,7 +1412,7 @@ static void net_loop() {
 }
 
 
-
+// -----------------------------------------------------
 
 static void move_peer_up_in_group(uint32_t prof, const std::string& id) {
     std::scoped_lock lk(g_mutex);
@@ -1692,17 +1684,18 @@ static void draw_group_table(uint32_t prof, const std::vector<Peer>& peers_snaps
         for (const Peer* p : ordered) {
             ImGui::TableNextRow();
 
-          
+            // Row index
             ImGui::TableSetColumnIndex(0);
             ImGui::Text("%d", ++row);
 
-         
+            // Determine dead/down state ONCE per peer
             bool is_dead = false;
             if (!p->account.empty() && dead_accounts_snapshot.count(p->account))
                 is_dead = true;
-           
+            else if (!p->name.empty() && dead_accounts_snapshot.count(p->name))
+                is_dead = true;
 
-
+            // Column 1: name (already greyed when dead)
             ImGui::TableSetColumnIndex(1);
             {
                 ImVec4 name_color = base_color;
@@ -1714,7 +1707,7 @@ static void draw_group_table(uint32_t prof, const std::vector<Peer>& peers_snaps
                 ImGui::TextColored(name_color, "%s", display_name.c_str());
             }
 
-            
+            // Column 2: skills / timers (NEW: grey out when dead)
             ImGui::TableSetColumnIndex(2);
             if (p->entries.empty()) {
                 if (is_dead) {
@@ -1766,7 +1759,7 @@ static void draw_group_table(uint32_t prof, const std::vector<Peer>& peers_snaps
                 }
             }
 
-          
+            // Column 3: reorder arrows (unchanged)
             ImGui::TableSetColumnIndex(3);
             const std::string up_id = "up##" + p->id;
             const std::string dn_id = "dn##" + p->id;
@@ -1811,9 +1804,9 @@ static void draw_squad_ui() {
     filtered.reserve(peers_snapshot.size());
 
     if (have_squad_accounts) {
-        
+        // We know who is in our squad -> show ONLY those accounts (plus self)
         for (auto& p : peers_snapshot) {
-           
+            // Always include our own client row
             if (p.id == g_client_id) {
                 filtered.push_back(p);
                 continue;
@@ -1821,11 +1814,12 @@ static void draw_squad_ui() {
 
             bool in_squad = false;
 
+            // Prefer account name match
             if (!p.account.empty() &&
                 squad_accounts.find(p.account) != squad_accounts.end()) {
                 in_squad = true;
             }
-            
+            // Fallback: character name match (older arc clients)
             else if (!p.name.empty() &&
                 squad_accounts.find(p.name) != squad_accounts.end()) {
                 in_squad = true;
@@ -1837,7 +1831,7 @@ static void draw_squad_ui() {
         }
     }
     else {
-        
+        // We don't have any squad account info yet -> only show ourselves
         for (auto& p : peers_snapshot) {
             if (p.id == g_client_id) {
                 filtered.push_back(p);
@@ -1853,7 +1847,9 @@ static void draw_squad_ui() {
         return;
     }
 
-    
+    // Custom profession order:
+    // ranger (4), ele (6), mes (7), necro (8),
+    // engi (3), war (2), guard (1), thief (5), rev (9)
     static const uint32_t PROF_ORDER[] = {
         4, // Ranger
         6, // Ele
@@ -1870,17 +1866,16 @@ static void draw_squad_ui() {
         draw_group_table(PROF_ORDER[i], peers_snapshot);
     }
 
-
+    // Unknown / prof=0 at the bottom
     draw_group_table(0, peers_snapshot);
 }
-
 
 
 static void __cdecl on_imgui(uint32_t not_charsel_or_loading, uint32_t) {
     if (!not_charsel_or_loading)
         return;
 
-  
+    // allow options_windows to draw again this frame if Options is open
     g_options_drawn_this_frame = false;
 
     if (!g_overlay_enabled)
@@ -1948,7 +1943,7 @@ static uintptr_t __cdecl options_windows(const char* windowname) {
         ImGui::Columns(2, "sqcd_ext_cols");
         ImGui::SetColumnWidth(0, 175.0f);
 
-
+        // ----- Overlay toggle -----
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.85f, 1.0f, 1.0f));
         ImGui::TextUnformatted("Overlay visible");
         ImGui::PopStyleColor();
@@ -1971,7 +1966,7 @@ static uintptr_t __cdecl options_windows(const char* windowname) {
 
         ImGui::NextColumn();
 
-
+        // ----- Share toggle -----
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.80f, 0.60f, 1.0f));
         ImGui::TextUnformatted("Share cooldowns");
         ImGui::PopStyleColor();
@@ -1994,8 +1989,8 @@ static uintptr_t __cdecl options_windows(const char* windowname) {
 
         ImGui::NextColumn();
 
-
-        ImGui::TextUnformatted("");
+        // ----- Room name ("Guild") -----
+        ImGui::TextUnformatted("");   // left column padding / spacer
         ImGui::NextColumn();
 
         {
@@ -2013,7 +2008,6 @@ static uintptr_t __cdecl options_windows(const char* windowname) {
             }
             ImGui::PopItemWidth();
 
-  
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.95f, 0.80f, 1.0f));
             ImGui::TextUnformatted("Guild");
@@ -2025,8 +2019,7 @@ static uintptr_t __cdecl options_windows(const char* windowname) {
 
     return 0;
 }
-
-
+ 
 
 static arcdps_exports g_exp{};
 
